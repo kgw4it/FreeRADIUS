@@ -570,6 +570,7 @@ sub authenticate {
                         # periodic poll for challenges
                         my $continue_poll = true;
                         my $challenge_found = false;
+			my $continue_counter = 0;
                         do {
                             sleep(5);
                             $response = $ua->get("$POLLURL/$token_serial");
@@ -618,7 +619,7 @@ sub authenticate {
                                 last;
                             }
 
-                        } while ($continue_poll && $challenge_found)
+                        } while ($continue_poll && $challenge_found && ++$continue_counter < 5)
 
                     }
                 } else {
