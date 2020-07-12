@@ -156,6 +156,8 @@ use Data::Dump;
 use Try::Tiny;
 use JSON;
 use Time::HiRes qw( gettimeofday tv_interval );
+use Date::Parse;
+use Date::Format;
 
 
 # use ...
@@ -225,6 +227,10 @@ our $cfg_file;
 
 $Config->{FSTAT} = "not found!";
 $Config->{URL}     = 'https://127.0.0.1/validate/check';
+$Config->{AUTHURL} = 'https://127.0.0.1/auth';
+$Config->{POLLURL} = 'https://127.0.0.1/token/challenges';
+$Config->{PIUSER}  = '';
+$Config->{PIPASS}  = '';
 $Config->{REALM}   = '';
 $Config->{CLIENTATTRIBUTE} = '';
 $Config->{RESCONF} = "";
@@ -244,6 +250,10 @@ foreach my $file (@CONFIG_FILES) {
         $CONFIG_FILE = $file;
         $Config->{FSTAT} = "found!";
         $Config->{URL} = $cfg_file->val("Default", "URL");
+        $Config->{AUTHURL} = $cfg_file->val("Default", "AUTHURL");
+        $Config->{POLLURL} = $cfg_file->val("Default", "POLLURL");
+        $Config->{PIUSER} = $cfg_file->val("Default", "PIUSER");
+        $Config->{PIPASS} = $cfg_file->val("Default", "PIPASS");
         $Config->{REALM}   = $cfg_file->val("Default", "REALM");
         $Config->{RESCONF} = $cfg_file->val("Default", "RESCONF");
         $Config->{Debug}   = $cfg_file->val("Default", "DEBUG");
@@ -355,6 +365,10 @@ sub authenticate {
 
     # we inherrit the defaults
     my $URL     = $Config->{URL};
+    my $AUTHURL = $Config->{AUTHURL};
+    my $POLLURL = $Config->{POLLURL};
+    my $PIUSER = $Config->{PIUSER};
+    my $PIPASS = $Config->{PIPASS};
     my $REALM   = $Config->{REALM};
     my $RESCONF = $Config->{RESCONF};
 
@@ -380,6 +394,18 @@ sub authenticate {
         &radiusd::radlog( Info, "Looking for config for auth-type $auth_type");
         if ( ( $cfg_file->val( $auth_type, "URL") )) {
             $URL = $cfg_file->val( $auth_type, "URL" );
+        }
+        if ( ( $cfg_file->val( $auth_type, "AUTHURL") )) {
+            $AUTHURL = $cfg_file->val( $auth_type, "AUTHURL" );
+        }
+        if ( ( $cfg_file->val( $auth_type, "POLLURL") )) {
+            $POLLURL = $cfg_file->val( $auth_type, "POLLURL" );
+        }
+        if ( ( $cfg_file->val( $auth_type, "PIUSER") )) {
+            $PIUSER = $cfg_file->val( $auth_type, "PIUSER" );
+        }
+        if ( ( $cfg_file->val( $auth_type, "PIPASS") )) {
+            $PIPASS = $cfg_file->val( $auth_type, "PIPASS" );
         }
         if ( ( $cfg_file->val( $auth_type, "REALM") )) {
             $REALM = $cfg_file->val( $auth_type, "REALM" );
@@ -441,6 +467,8 @@ sub authenticate {
 
     &radiusd::radlog( Info, "Auth-Type: $auth_type" );
     &radiusd::radlog( Info, "url: $URL" );
+    &radiusd::radlog( Info, "pollurl: $POLLURL" );
+    &radiusd::radlog( Info, "authurl: $AUTHURL" );
     &radiusd::radlog( Info, "user sent to privacyidea: $params{'user'}" );
     &radiusd::radlog( Info, "realm sent to privacyidea: $params{'realm'}" );
     &radiusd::radlog( Info, "resolver sent to privacyidea: $params{'resConf'}" );
@@ -499,24 +527,145 @@ sub authenticate {
             $g_return = RLM_MODULE_OK;
         }
         elsif ( $decoded->{result}{status} ) {
-            &radiusd::radlog( Info, "privacyIDEA Result status is true!" );
+            &radiusd::radlog( Info, "privacyIDEA Result status is true! $content" );
             $RAD_REPLY{'Reply-Message'} = $decoded->{detail}{message};
             if ( $decoded->{detail}{transaction_id} ) {
+                $RAD_REPLY{'State'} = $decoded->{detail}{transaction_id};
                 ## we are in challenge response mode:
-                ## 1. split the response in fail, state and challenge
+                ## OTP
+                ## 1. split the response into fail, state and challenge
                 ## 2. show the client the challenge and the state
                 ## 3. get the response and
-                ## 4. submit the response and the state to linotp and
+                ## 4. submit the response and the state to privacyIDEA and
                 ## 5. reply ok or reject
-                $RAD_REPLY{'State'} = $decoded->{detail}{transaction_id};
-                $RAD_CHECK{'Response-Packet-Type'} = "Access-Challenge";
-                # Add the response hash to the Radius Reply
-                %RAD_REPLY = ( %RAD_REPLY, mapResponse($decoded));
-                $g_return  = RLM_MODULE_HANDLED;
+                ##
+                ## PUSH
+                ## 1. split the response into fail, state and challenge
+                ## 2. poll endpoint for challenge
+                ## 3. reply ok or reject if expired
+                my $token_type = $decoded->{detail}{type};
+                if ($token_type eq "push") {
+                    # perform periodic polling for response
+                    my $token_serial = $decoded->{detail}{serial};
+                    $RAD_REPLY{'Reply-Message'} = "privacyIDEA token challenge poll failed";
+                    $g_return = RLM_MODULE_FAIL;
+
+                    # retrieve an authorization token from privacyIDEA
+                    %params = ();
+                    $params{"username"} = $PIUSER;
+                    $params{"password"} = $PIPASS;
+                    $starttime = [gettimeofday];
+                    $response = $ua->post( $AUTHURL, \%params );
+                    $content  = $response->decoded_content();
+                    $elapsedtime = tv_interval($starttime);
+                    &radiusd::radlog( Info, "elapsed time for privacyidea call: $elapsedtime" );
+                    if ( $debug == true ) {
+                        &radiusd::radlog( Debug, "Auth Content $content" );
+                    }
+                    $decoded = $coder->decode($content);
+                    if ($response->is_success && $decoded->{result}{value}) {
+                        my $auth_token = $decoded->{result}{value}{token};
+                        $ua->default_header('Authorization' => $auth_token);
+
+                        # periodic poll for challenges
+                        my $continue_poll = true;
+                        my $challenge_found = false;
+                        do {
+                            sleep(5);
+                            $response = $ua->get("$POLLURL/$token_serial");
+                            my $content = $response->decoded_content();
+                            if ($debug == true) {
+                                &radiusd::radlog(Debug, "TokenChallenges Content $content");
+                            }
+                            $decoded = $coder->decode($content);
+                            if ($response->is_success && $decoded->{result}{status}) {
+                                # check for challenge matching our transaction id
+                                for my $challenge( @{$decoded->{result}{value}{challenges}} ) {
+                                    if ($debug == true) {
+                                        &radiusd::radlog(Debug, $challenge);
+                                    }
+
+                                    if ($challenge->{"transaction_id"} eq $RAD_REPLY{'State'}) {
+                                        $challenge_found = true;
+                                        &radiusd::radlog( Info, "challenge object found: ".$challenge->{"challenge"} );
+                                        if ($challenge->{"otp_valid"} == true) {
+                                            # user approved request
+                                            &radiusd::radlog( Info, "privacyIDEA access granted" );
+                                            $RAD_REPLY{'Reply-Message'} = "privacyIDEA access granted";
+                                            # Add the response hash to the Radius Reply
+                                            %RAD_REPLY = ( %RAD_REPLY, mapResponse($decoded));
+                                            $g_return = RLM_MODULE_OK;
+                                            $continue_poll = false;
+                                            last;
+                                        } else {
+                                            # check for expiration of request
+                                            my $expiry = str2time($challenge->{"expiration"});
+                                            if ($expiry < time()) {
+                                                &radiusd::radlog( Info, "privacyIDEA access denied" );
+                                                $RAD_REPLY{'Reply-Message'} = "privacyIDEA push token timed out!";
+                                                $g_return = RLM_MODULE_REJECT;
+                                                $continue_poll = false;
+                                                last;
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                # request failed
+                                if ($debug == true) {
+                                    &radiusd::radlog(Debug, "privacyIDEA token challenge failed");
+                                }
+                                last;
+                            }
+
+                        } while ($continue_poll && $challenge_found)
+
+                    }
+                } else {
+                    $RAD_CHECK{'Response-Packet-Type'} = "Access-Challenge";
+		    $RAD_REPLY{'Reply-Message'} = "Bitte geben Sie Ihr Passwort ein und bestätigen Sie dann die Anmeldung mit der PrivacyIDEA App.";
+                    # Add the response hash to the Radius Reply
+                    %RAD_REPLY = (%RAD_REPLY, mapResponse($decoded));
+                    $g_return = RLM_MODULE_HANDLED;
+                }
             } else {
-                &radiusd::radlog( Info, "privacyIDEA access denied" );
-                #$RAD_REPLY{'Reply-Message'} = "privacyIDEA access denied";
-                $g_return = RLM_MODULE_REJECT;
+               if ($RAD_REQUEST{'User-Password'} eq $RAD_REQUEST{'User-Name'}) {
+                   $RAD_CHECK{'Response-Packet-Type'} = "Access-Challenge";
+                   $RAD_REPLY{'Reply-Message'} = "Bitte geben Sie Ihr Passwort ein und bestätigen Sie dann die Anmeldung mit der PrivacyIDEA App.";
+                   # Add the response hash to the Radius Reply
+                   %RAD_REPLY = (%RAD_REPLY, mapResponse($decoded));
+                   $g_return = RLM_MODULE_HANDLED;
+                } elsif ($decoded->{detail}{message} eq "Failcounter exceeded") {
+                   &radiusd::radlog( Info, "privacyIDEA access blocked" );
+                   $RAD_CHECK{'Response-Packet-Type'} = "Access-Challenge";
+                   $RAD_REPLY{'Reply-Message'} = "Ihr Zugang wurde leider blockiert. Bitte setzen Sie sich mit dem Helpdesk in Verbindung.";
+                   %RAD_REPLY = (%RAD_REPLY, mapResponse($decoded));
+                   $g_return = RLM_MODULE_HANDLED;
+                } elsif ($decoded->{detail}{message} eq "The user has no tokens assigned") {
+                    # user has no token assigned
+		    # try a normal login
+		    %params = ();
+                    $params{"username"} = $RAD_REQUEST{'User-Name'};
+                    $params{"password"} = $RAD_REQUEST{'User-Password'};
+                    $response = $ua->post( $AUTHURL, \%params );
+                    $content  = $response->decoded_content();
+                    $decoded = $coder->decode($content);
+                    if ($response->is_success && $decoded->{result}{value}) {
+                        &radiusd::radlog( Info, "privacyIDEA no token assigned" );
+                        $RAD_REPLY{'Reply-Message'} = "privacyIDEA no token assigned";
+                        # Add the response hash to the Radius Reply
+                        %RAD_REPLY = ( %RAD_REPLY, mapResponse($decoded));
+                        $g_return = RLM_MODULE_OK;
+		   } else {
+                        &radiusd::radlog( Info, "privacyIDEA access denied (1) $content" );
+                        #$RAD_REPLY{'Reply-Message'} = "privacyIDEA access denied";
+                        $g_return = RLM_MODULE_REJECT;
+		   }
+		} else {
+                    &radiusd::radlog( Info, "privacyIDEA access denied (2) $content" );
+                    #$RAD_REPLY{'Reply-Message'} = "privacyIDEA access denied";
+                    $g_return = RLM_MODULE_REJECT;
+	        }
             }
         }
         elsif ( !$decoded->{result}{status}) {
